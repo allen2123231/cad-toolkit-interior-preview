@@ -1,0 +1,78 @@
+name: 室內測試群專用發布
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 已核對的 cad-toolkit 來源提交或分支（須包含群組隔離機制）
+        required: true
+      version:
+        description: 新版本，例如 0.6.6-preview.1（必須高於目前安裝版）
+        required: true
+permissions:
+  contents: write
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: allen2123231/cad-toolkit
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: 固定室內群設定並檢查
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python -m pip install tomlkit==0.13.3
+          python scripts/set_distribution_profile.py --group interior --version $env:RELEASE_VERSION
+          python scripts/check_distribution.py
+          python scripts/create_content.py
+          python -m unittest discover -s tests
+      - name: 建置與群組驗證
+        run: |
+          python scripts/build_payload.py
+          dotnet publish installer/CadToolkitSetup.csproj -c Release -o dist/setup
+          python scripts/finalize_release.py
+          python scripts/check_distribution.py --manifest dist/release-manifest.json --payload dist/cad-toolkit-payload.zip --setup dist/McpToolkitSetup.exe
+          dotnet run --project tests/distribution/DistributionChecks.csproj -c Release
+          dotnet run --project tests/desktop/DesktopChecks.csproj -c Release -- test-results/distribution-ui --repro-distribution
+      - name: 核對簽章
+        shell: pwsh
+        run: |
+          python scripts/signing_inventory.py --payload dist/cad-toolkit-payload.zip --installer dist/McpToolkitSetup.exe --output .build/signing-inventory.json
+          ./scripts/audit_signatures.ps1 -Inventory .build/signing-inventory.json -Output dist/signature-audit.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: interior-preview-windows
+          path: dist/
+      - name: 僅建立室內庫草稿，簽章通過才公開
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REPOSITORY -ne 'allen2123231/cad-toolkit-interior-preview') { throw '禁止發布到其他群組的儲存庫' }
+          $manifest=Get-Content dist/release-manifest.json -Raw | ConvertFrom-Json
+          if ($manifest.audience -ne 'interior') { throw '套件不屬於室內群' }
+          $version=$manifest.version
+          if (!$version.Contains('-')) { throw '此流程只接受測試版本' }
+          $tag="interior-v$version"
+          python scripts/check_distribution.py --tag $tag --manifest dist/release-manifest.json --payload dist/cad-toolkit-payload.zip --setup dist/McpToolkitSetup.exe
+          if ($LASTEXITCODE -ne 0) { throw '發布驗證失敗' }
+          $existing=gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft --jq '.isDraft' 2>$null
+          if ($LASTEXITCODE -eq 0) { throw '此版本已有草稿或發布內容，請先檢查；不覆寫附件' }
+          $commit=git rev-parse HEAD
+          @("MCP Toolkit $version — 室內設計測試群",'',"來源提交：$commit",'只提供開發者指定的測試安裝。原測試群不會收到此版。','簽章未通過時保留草稿，不會自動公開。') | Set-Content .build/interior-release-notes.md -Encoding utf8
+          gh release create $tag --repo $env:GITHUB_REPOSITORY --target main --title "MCP Toolkit $version — 室內設計測試群" --notes-file .build/interior-release-notes.md --draft --prerelease dist/McpToolkitSetup.exe dist/McpToolkit.exe dist/cad-toolkit-payload.zip dist/release-manifest.json dist/SHA256SUMS.txt dist/signature-audit.json
+          if ($LASTEXITCODE -ne 0) { throw '草稿建立失敗' }
+          $audit=Get-Content dist/signature-audit.json -Raw | ConvertFrom-Json
+          if (!$audit.all_signatures_valid) { throw '簽章未通過，保留室內群草稿；未簽章版本需另行取得該版本的明確公開授權' }
+          gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false
